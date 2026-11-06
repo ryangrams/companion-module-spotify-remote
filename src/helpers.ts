@@ -129,18 +129,23 @@ export async function PreviousSong(instance: SpotifyInstanceBase, deviceId: stri
 	}
 }
 
-export async function TransferPlayback(instance: SpotifyInstanceBase, deviceId: string, attempt = 0): Promise<void> {
+export async function TransferPlayback(
+	instance: SpotifyInstanceBase,
+	deviceId: string,
+	startPlaying = true,
+	attempt = 0,
+): Promise<void> {
 	const reqOptions = instance.getRequestOptionsBase()
 	if (!reqOptions) return
 
 	try {
 		await transferMyPlayback(reqOptions, [deviceId], {
-			play: true,
+			play: startPlaying,
 		})
 	} catch (err) {
 		const retry = await instance.checkIfApiErrorShouldRetry(err)
 		if (retry && attempt <= MAX_ATTEMPTS) {
-			return TransferPlayback(instance, deviceId, attempt + 1)
+			return TransferPlayback(instance, deviceId, startPlaying, attempt + 1)
 		} else {
 			throw err
 		}
@@ -382,6 +387,85 @@ export async function PlaySpecificTracks(
 				fadeDurationMs,
 				attempt + 1,
 			)
+		} else {
+			throw err
+		}
+	}
+}
+
+export interface StartPlaylistOptions {
+	behavior: 'return' | 'resume' | 'force'
+	shuffle: 'leave' | 'on' | 'off'
+	/** Track count, used to start a shuffled playlist on a random track rather than always the first */
+	trackCount: number | null
+	fadeIn: boolean
+	startVolume: number
+	targetVolume: number
+	fadeDurationMs: number
+}
+
+/**
+ * Start a playlist on the given device, optionally forcing shuffle on or off.
+ * Spotify's shuffle flag only reorders what comes after the current track, so a shuffled start
+ * also picks a random first track.
+ */
+export async function StartPlaylist(
+	instance: SpotifyInstanceBase,
+	deviceId: string,
+	context_uri: string,
+	options: StartPlaylistOptions,
+	attempt = 0,
+): Promise<void> {
+	if (options.shuffle !== 'on') {
+		await PlaySpecificList(
+			instance,
+			deviceId,
+			context_uri,
+			options.behavior,
+			options.fadeIn,
+			options.startVolume,
+			options.targetVolume,
+			options.fadeDurationMs,
+		)
+		if (options.shuffle === 'off') await ChangeShuffleState(instance, deviceId, false)
+		return
+	}
+
+	const reqOptions = instance.getRequestOptionsBase()
+	if (!reqOptions) return
+
+	try {
+		if (options.behavior !== 'force') {
+			const data = await getMyCurrentPlaybackState(reqOptions)
+			if (data.body?.context?.uri === context_uri) {
+				if (options.behavior === 'resume' && !data.body.is_playing) {
+					await play(reqOptions, { deviceId })
+				} else {
+					instance.log('warn', `Already playing that ${context_uri}`)
+				}
+				await ChangeShuffleState(instance, deviceId, true)
+				return
+			}
+		}
+
+		if (options.fadeIn) {
+			await ChangeVolume(instance, deviceId, true, Number(options.startVolume))
+		}
+
+		const offset =
+			options.trackCount && options.trackCount > 1
+				? { position: Math.floor(Math.random() * options.trackCount) }
+				: undefined
+		await play(reqOptions, { deviceId, context_uri, ...(offset ? { offset } : {}) })
+		await setShuffle(reqOptions, true, { deviceId })
+
+		if (options.fadeIn) {
+			await FadeVolume(instance, deviceId, Number(options.targetVolume), Number(options.fadeDurationMs))
+		}
+	} catch (err) {
+		const retry = await instance.checkIfApiErrorShouldRetry(err)
+		if (retry && attempt <= MAX_ATTEMPTS) {
+			return StartPlaylist(instance, deviceId, context_uri, options, attempt + 1)
 		} else {
 			throw err
 		}

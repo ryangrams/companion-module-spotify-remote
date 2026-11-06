@@ -1,5 +1,12 @@
-import { CompanionActionDefinitions, CompanionActionDefinition } from '@companion-module/base'
+import {
+	CompanionActionDefinitions,
+	CompanionActionDefinition,
+	SomeCompanionActionInputField,
+	DropdownChoice,
+} from '@companion-module/base'
 import { SpotifyInstanceBase } from './types.js'
+import { SpotifyPlaylistInfo } from './state.js'
+import { MAX_PLAYLIST_SLOTS } from './config.js'
 import {
 	ChangePlayState,
 	ChangeRepeatState,
@@ -12,6 +19,8 @@ import {
 	QueueItem,
 	SeekPosition,
 	SkipSong,
+	StartPlaylist,
+	StartPlaylistOptions,
 	TransferPlayback,
 } from './helpers.js'
 import { getMyDevices } from './api/device.js'
@@ -42,11 +51,119 @@ export enum ActionId {
 	Mute = 'mute',
 	Unmute = 'unmute',
 	MuteToggle = 'muteToggle',
+	PlayPlaylist = 'playPlaylist',
+	PlayPlaylistSlot = 'playPlaylistSlot',
+	PlaylistPage = 'playlistPage',
+	RefreshPlaylists = 'refreshPlaylists',
+	TransferToPlaybackDevice = 'transferToPlaybackDevice',
 }
 
 export type DoAction = (instance: SpotifyInstanceBase, deviceId: string | null) => Promise<void>
 
-export function GetActionsList(executeAction: (fcn: DoAction) => Promise<void>): CompanionActionDefinitions {
+/** Options shared by the actions that start a playlist */
+function playlistStartOptions(): SomeCompanionActionInputField[] {
+	return [
+		{
+			type: 'dropdown',
+			default: 'return',
+			label: 'If This Playlist Is Already Playing',
+			id: 'behavior',
+			choices: [
+				{ id: 'return', label: 'Do Nothing' },
+				{ id: 'resume', label: 'Play (if paused)' },
+				{ id: 'force', label: 'Start Again From the Top' },
+			],
+		},
+		{
+			type: 'dropdown',
+			default: 'leave',
+			label: 'Shuffle',
+			id: 'shuffle',
+			choices: [
+				{ id: 'leave', label: 'Leave As It Is' },
+				{ id: 'on', label: 'On, Starting on a Random Track' },
+				{ id: 'off', label: 'Off, Starting on the First Track' },
+			],
+		},
+		{
+			type: 'checkbox',
+			label: 'Fade In Volume',
+			id: 'fadeIn',
+			default: false,
+		},
+		{
+			type: 'number',
+			label: 'Start Volume',
+			id: 'startVolume',
+			default: 0,
+			min: 0,
+			max: 100,
+			step: 1,
+			isVisible: (options) => options.fadeIn === true,
+		},
+		{
+			type: 'number',
+			label: 'Target Volume',
+			id: 'targetVolume',
+			default: 85,
+			min: 0,
+			max: 100,
+			step: 1,
+			isVisible: (options) => options.fadeIn === true,
+		},
+		{
+			type: 'number',
+			label: 'Fade Duration (milliseconds)',
+			id: 'fadeDurationMs',
+			default: 5000,
+			min: 500,
+			max: 300000,
+			step: 500,
+			isVisible: (options) => options.fadeIn === true,
+		},
+	]
+}
+
+function readPlaylistStartOptions(
+	options: Record<string, unknown>,
+	playlist: SpotifyPlaylistInfo | null,
+): StartPlaylistOptions {
+	const behavior = options.behavior === 'resume' || options.behavior === 'force' ? options.behavior : 'return'
+	const shuffle = options.shuffle === 'on' || options.shuffle === 'off' ? options.shuffle : 'leave'
+	return {
+		behavior,
+		shuffle,
+		trackCount: playlist?.trackCount ?? null,
+		fadeIn: options.fadeIn === true,
+		startVolume: Number(options.startVolume),
+		targetVolume: Number(options.targetVolume),
+		fadeDurationMs: Number(options.fadeDurationMs),
+	}
+}
+
+/** Dropdown choices for every playlist the module knows about */
+export function playlistChoices(playlists: SpotifyPlaylistInfo[] | null): DropdownChoice[] {
+	return (playlists ?? []).map((p) => ({
+		id: p.id,
+		label: p.ownerName ? `${p.name} (${p.ownerName})` : p.name,
+	}))
+}
+
+/** Accepts a bare playlist id, a spotify:playlist: uri or an open.spotify.com link */
+export function normalisePlaylistId(value: string): string {
+	const trimmed = value.trim()
+	const linkMatch = trimmed.match(/open\.spotify\.com\/(?:[a-z-]+\/)?playlist\/([A-Za-z0-9]+)/)
+	if (linkMatch) return linkMatch[1]
+	if (trimmed.startsWith('spotify:')) return trimmed.substring(trimmed.lastIndexOf(':') + 1)
+	return trimmed
+}
+
+export function GetActionsList(
+	executeAction: (fcn: DoAction) => Promise<void>,
+	playlists: SpotifyPlaylistInfo[] | null,
+): CompanionActionDefinitions {
+	const choices = playlistChoices(playlists)
+
 	const executeActionIfHasDeviceId = async (
 		actionName: string,
 		action: (instance: SpotifyInstanceBase, deviceId: string) => Promise<void>,
@@ -663,6 +780,116 @@ export function GetActionsList(executeAction: (fcn: DoAction) => Promise<void>):
 					} else {
 						await ChangeVolume(instance, deviceId, true, instance.premuteVolume)
 					}
+				})
+			},
+		},
+		[ActionId.PlayPlaylist]: {
+			name: 'Play One of My Playlists',
+			description: 'Pick from the playlists in your Spotify library, or paste a playlist link or ID',
+			options: [
+				{
+					type: 'dropdown',
+					label: 'Playlist',
+					id: 'playlist',
+					choices,
+					default: choices[0]?.id ?? '',
+					allowCustom: true,
+					tooltip: 'If your playlist is missing, run "Refresh My Playlists" or paste its link',
+				},
+				...playlistStartOptions(),
+			],
+			callback: async (action, context) => {
+				const raw = await context.parseVariablesInString(String(action.options.playlist ?? ''))
+				const playlistId = normalisePlaylistId(raw)
+				if (!playlistId) return
+
+				await executeActionIfHasDeviceId('play playlist', async (instance, deviceId) => {
+					const playlist = instance.findPlaylist(playlistId)
+					StartPlaylist(
+						instance,
+						deviceId,
+						`spotify:playlist:${playlistId}`,
+						readPlaylistStartOptions(action.options, playlist),
+					).catch((err) => instance.log('warn', `Play playlist failed: ${formatApiError(err)}`))
+				})
+			},
+		},
+		[ActionId.PlayPlaylistSlot]: {
+			name: 'Playlist Browser: Play the Playlist in a Slot',
+			description: 'Plays whichever playlist the browser currently shows in this slot',
+			options: [
+				{
+					type: 'number',
+					label: 'Slot',
+					id: 'slot',
+					default: 1,
+					min: 1,
+					max: MAX_PLAYLIST_SLOTS,
+					step: 1,
+				},
+				...playlistStartOptions(),
+			],
+			callback: async (action) => {
+				const slot = Number(action.options.slot)
+				await executeActionIfHasDeviceId('play playlist slot', async (instance, deviceId) => {
+					const playlist = instance.getPlaylistInSlot(slot)
+					if (!playlist) {
+						instance.log('info', `Playlist browser slot ${slot} is empty`)
+						return
+					}
+					StartPlaylist(instance, deviceId, playlist.uri, readPlaylistStartOptions(action.options, playlist)).catch(
+						(err) => instance.log('warn', `Play playlist failed: ${formatApiError(err)}`),
+					)
+				})
+			},
+		},
+		[ActionId.PlaylistPage]: {
+			name: 'Playlist Browser: Change Page',
+			options: [
+				{
+					type: 'dropdown',
+					label: 'Page',
+					id: 'direction',
+					default: 'next',
+					choices: [
+						{ id: 'next', label: 'Next Page' },
+						{ id: 'previous', label: 'Previous Page' },
+						{ id: 'first', label: 'First Page' },
+					],
+				},
+			],
+			callback: async (action) => {
+				await executeAction(async (instance) => {
+					const direction = action.options.direction
+					instance.changePlaylistPage(direction === 'first' ? 'first' : direction === 'previous' ? -1 : 1)
+				})
+			},
+		},
+		[ActionId.RefreshPlaylists]: {
+			name: 'Refresh My Playlists',
+			description: 'Fetch your playlists from Spotify now. They also refresh on their own every few minutes.',
+			options: [],
+			callback: async () => {
+				await executeAction(async (instance) => {
+					await instance.refreshPlaylists()
+				})
+			},
+		},
+		[ActionId.TransferToPlaybackDevice]: {
+			name: 'Bring Playback to the Playback Device',
+			description:
+				'Moves whatever is playing back to the device chosen in the connection settings, for when someone started music on a phone',
+			options: [
+				{
+					type: 'checkbox',
+					label: 'Start Playing If Paused',
+					id: 'play',
+					default: false,
+				},
+			],
+			callback: async (action) => {
+				await executeActionIfHasDeviceId('bring playback to the playback device', async (instance, deviceId) => {
+					await TransferPlayback(instance, deviceId, action.options.play === true)
 				})
 			},
 		},

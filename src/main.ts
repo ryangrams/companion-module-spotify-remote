@@ -11,11 +11,14 @@ import PQueue from 'p-queue'
 import { GetConfigFields, DeviceConfig, DEFAULT_CONFIG, ensureRequiredConfigIsDefined } from './config.js'
 import { FeedbackId, GetFeedbacksList } from './feedback.js'
 import { DoAction, GetActionsList } from './actions.js'
-import { SpotifyPlaybackState, SpotifyState } from './state.js'
+import { GetPresetsList } from './presets.js'
+import { SpotifyPlaybackState, SpotifyPlaylistInfo, SpotifyState } from './state.js'
 import { SpotifyInstanceBase } from './types.js'
 import { UpgradeScripts } from './upgrades.js'
 import { authorizationCodeGrant, GenerateAuthorizeUrl, refreshAccessToken } from './api/auth.js'
 import { getMyCurrentPlaybackState } from './api/playback.js'
+import { getMyDevices } from './api/device.js'
+import { getImageBuffer, getMyPlaylists, PLAYLIST_PAGE_LIMIT, SimplifiedPlaylistResponse } from './api/library.js'
 import { formatApiError, isInvalidGrantError, RequestOptionsBase } from './api/util.js'
 
 const AUTH_SCOPES = [
@@ -31,6 +34,39 @@ const AUTH_SCOPES = [
 	'user-read-playback-position',
 ]
 
+/** Check the device list on every Nth playback poll, to stay well clear of the API rate limit */
+const DEVICE_POLL_EVERY = 5
+/** How often the playlist library is fetched again without being asked */
+const PLAYLIST_REFRESH_MS = 10 * 60 * 1000
+/** Stop paging the library after this many playlists */
+const MAX_PLAYLISTS = 1000
+/** Cover art is skipped above this size, so one huge upload cannot bloat every button render */
+const MAX_COVER_ART_BYTES = 256 * 1024
+/** Covers at least this wide look sharp on a 72px button; smaller ones are only used as a fallback */
+const MIN_COVER_ART_WIDTH = 60
+
+function pickCoverImage(images: SpotifyApi.ImageObject[] | null | undefined): string | null {
+	if (!images || images.length === 0) return null
+	// Spotify lists the largest first; custom uploads come back as a single image with no size
+	const sized = images.filter((i) => typeof i.width === 'number' && i.width >= MIN_COVER_ART_WIDTH)
+	if (sized.length === 0) return images[images.length - 1].url
+	sized.sort((a, b) => (a.width ?? 0) - (b.width ?? 0))
+	// Prefer the smallest image that is still at least twice the button size, for a clean downscale
+	return (sized.find((i) => (i.width ?? 0) >= 144) ?? sized[sized.length - 1]).url
+}
+
+function toPlaylistInfo(raw: SimplifiedPlaylistResponse): SpotifyPlaylistInfo {
+	const total = raw.items?.total ?? raw.tracks?.total
+	return {
+		id: raw.id,
+		name: raw.name,
+		uri: raw.uri,
+		ownerName: raw.owner?.display_name ?? null,
+		imageUrl: pickCoverImage(raw.images),
+		trackCount: typeof total === 'number' ? total : null,
+	}
+}
+
 class SpotifyInstance extends InstanceBase<DeviceConfig> implements SpotifyInstanceBase {
 	public config: DeviceConfig
 
@@ -43,10 +79,15 @@ class SpotifyInstance extends InstanceBase<DeviceConfig> implements SpotifyInsta
 	private readonly state: SpotifyState
 	private readonly pollQueue = new PQueue({ concurrency: 1 })
 
+	private pollCount = 0
+	private lastPlaylistRefresh = 0
+	private playlistRefresh: Promise<void> | null = null
+	private readonly coverArtCache = new Map<string, Promise<string | null>>()
+
 	constructor(internal: unknown) {
 		super(internal)
 
-		this.state = { playbackState: null }
+		this.state = { playbackState: null, playlists: null, playlistPage: 0, devices: null }
 
 		this.config = { ...DEFAULT_CONFIG }
 	}
@@ -159,6 +200,11 @@ class SpotifyInstance extends InstanceBase<DeviceConfig> implements SpotifyInsta
 		this.setupOrRefreshAuthentication(true)
 
 		this.initActions()
+		this.initFeedbacks()
+		this.initVariables()
+		this.initPresets()
+		this.changePlaylistPage(0)
+		this.checkFeedbacks()
 	}
 
 	override updateStatus(status: InstanceStatus, message?: string | null): void {
@@ -250,6 +296,8 @@ class SpotifyInstance extends InstanceBase<DeviceConfig> implements SpotifyInsta
 		this.initActions()
 		this.initFeedbacks()
 		this.initVariables()
+		this.initPresets()
+		this.updatePlaylistBrowserVariables()
 	}
 
 	async destroy(): Promise<void> {
@@ -266,7 +314,141 @@ class SpotifyInstance extends InstanceBase<DeviceConfig> implements SpotifyInsta
 		}
 	}
 	getConfigFields(): SomeCompanionConfigField[] {
-		return GetConfigFields(this.state.playbackState?.deviceInfo?.id)
+		return GetConfigFields(this.state.playbackState?.deviceInfo?.id, this.state.devices, this.config.deviceId)
+	}
+
+	public async refreshPlaylists(): Promise<void> {
+		// Share one fetch between overlapping callers, such as a button press during the timed refresh
+		if (!this.playlistRefresh) {
+			this.playlistRefresh = this.doRefreshPlaylists().finally(() => {
+				this.playlistRefresh = null
+			})
+		}
+		return this.playlistRefresh
+	}
+
+	private async doRefreshPlaylists(attempt = 0): Promise<void> {
+		const reqOptions = this.getRequestOptionsBase()
+		if (!reqOptions) return
+
+		try {
+			const playlists: SpotifyPlaylistInfo[] = []
+			let offset = 0
+			while (offset < MAX_PLAYLISTS) {
+				const page = await getMyPlaylists(reqOptions, offset)
+				const items = page.body?.items ?? []
+				for (const item of items) {
+					// Spotify returns null entries for playlists that can no longer be read
+					if (item?.id) playlists.push(toPlaylistInfo(item))
+				}
+				if (!page.body?.next || items.length < PLAYLIST_PAGE_LIMIT) break
+				offset += PLAYLIST_PAGE_LIMIT
+			}
+
+			this.lastPlaylistRefresh = Date.now()
+			this.state.playlists = playlists
+			this.log('debug', `Loaded ${playlists.length} playlists`)
+
+			this.initActions()
+			this.initFeedbacks()
+			this.initPresets()
+			this.changePlaylistPage(0)
+		} catch (err) {
+			const retry = await this.checkIfApiErrorShouldRetry(err)
+			if (retry && attempt < 2) return this.doRefreshPlaylists(attempt + 1)
+
+			// Try again on a later poll rather than hammering a failing API
+			this.lastPlaylistRefresh = Date.now()
+			this.log('warn', `Failed to load playlists: ${formatApiError(err)}`)
+		}
+	}
+
+	private get playlistPageCount(): number {
+		const count = this.state.playlists?.length ?? 0
+		return Math.max(1, Math.ceil(count / this.config.playlistSlots))
+	}
+
+	public changePlaylistPage(delta: number | 'first'): void {
+		const pageCount = this.playlistPageCount
+		const target = delta === 'first' ? 0 : this.state.playlistPage + delta
+		// Wrap at either end, so a single "next" button walks the whole library
+		this.state.playlistPage = ((target % pageCount) + pageCount) % pageCount
+
+		this.updatePlaylistBrowserVariables()
+		this.checkFeedbacks(FeedbackId.PlaylistSlotArt, FeedbackId.PlaylistSlotIsPlaying)
+	}
+
+	public getPlaylistInSlot(slot: number): SpotifyPlaylistInfo | null {
+		if (!Number.isInteger(slot) || slot < 1 || slot > this.config.playlistSlots) return null
+		const index = this.state.playlistPage * this.config.playlistSlots + (slot - 1)
+		return this.state.playlists?.[index] ?? null
+	}
+
+	public findPlaylist(idOrUri: string): SpotifyPlaylistInfo | null {
+		const id = idOrUri.startsWith('spotify:') ? idOrUri.substring(idOrUri.lastIndexOf(':') + 1) : idOrUri
+		return this.state.playlists?.find((p) => p.id === id) ?? null
+	}
+
+	public async getCoverArt(url: string): Promise<string | null> {
+		let cached = this.coverArtCache.get(url)
+		if (!cached) {
+			cached = getImageBuffer(url)
+				.then(({ buffer, contentType }) => {
+					if (buffer.length > MAX_COVER_ART_BYTES) {
+						this.log('debug', `Skipping cover art over ${MAX_COVER_ART_BYTES} bytes: ${url}`)
+						return null
+					}
+					const mime = contentType?.startsWith('image/') ? contentType : 'image/jpeg'
+					return `data:${mime};base64,${buffer.toString('base64')}`
+				})
+				.catch((err) => {
+					this.log('debug', `Failed to load cover art: ${formatApiError(err)}`)
+					// Forget the failure so the next render tries again
+					this.coverArtCache.delete(url)
+					return null
+				})
+			this.coverArtCache.set(url, cached)
+		}
+		return cached
+	}
+
+	private updatePlaylistBrowserVariables(): void {
+		const values: { [variableId: string]: string | number | undefined } = {}
+		for (let slot = 1; slot <= this.config.playlistSlots; slot++) {
+			values[`playlistSlot${slot}Name`] = this.getPlaylistInSlot(slot)?.name ?? ''
+		}
+		values['playlistCount'] = this.state.playlists?.length ?? 0
+		values['playlistPage'] = this.state.playlistPage + 1
+		values['playlistPageCount'] = this.playlistPageCount
+		values['playlistPageLabel'] = `${this.state.playlistPage + 1}/${this.playlistPageCount}`
+		this.setVariableValues(values)
+	}
+
+	private async doPollDevices(): Promise<void> {
+		const reqOptions = this.getRequestOptionsBase()
+		if (!reqOptions) return
+
+		try {
+			const data = await getMyDevices(reqOptions)
+			this.state.devices = (data.body?.devices ?? [])
+				.filter((d): d is SpotifyApi.UserDevice & { id: string } => !!d.id)
+				.map((d) => ({ id: d.id, name: d.name, type: d.type, isActive: d.is_active }))
+		} catch (err) {
+			// Leave the last known list in place; a single failed poll should not raise a warning
+			this.log('debug', `Device poll failed: ${formatApiError(err)}`)
+			return
+		}
+
+		const playbackDevice = this.state.devices.find((d) => d.id === this.config.deviceId)
+		this.setVariableValues({
+			playbackDeviceName: playbackDevice?.name ?? '',
+			playbackDeviceOnline: !!playbackDevice,
+		})
+		this.checkFeedbacks(FeedbackId.PlaybackDeviceOffline, FeedbackId.PlayingOnAnotherDevice)
+	}
+
+	private initPresets() {
+		this.setPresetDefinitions(GetPresetsList(this.label, this.state.playlists, this.config.playlistSlots))
 	}
 	private initActions() {
 		const executeActionWrapper = async (fcn: DoAction) => {
@@ -284,7 +466,7 @@ class SpotifyInstance extends InstanceBase<DeviceConfig> implements SpotifyInsta
 			}
 		}
 
-		const actions = GetActionsList(executeActionWrapper)
+		const actions = GetActionsList(executeActionWrapper, this.state.playlists)
 		this.setActionDefinitions(actions)
 	}
 	// Set up Feedbacks
@@ -317,7 +499,16 @@ class SpotifyInstance extends InstanceBase<DeviceConfig> implements SpotifyInsta
 			{ variableId: 'deviceName', name: 'Current device name' },
 			{ variableId: 'deviceId', name: 'Current device id' },
 			{ variableId: 'premuteVolume', name: 'Volume before mute' },
+			{ variableId: 'playbackDeviceName', name: 'Name of the playback device chosen in the settings' },
+			{ variableId: 'playbackDeviceOnline', name: 'Is the playback device online in Spotify' },
+			{ variableId: 'playlistCount', name: 'Number of playlists in your library' },
+			{ variableId: 'playlistPage', name: 'Playlist browser page number' },
+			{ variableId: 'playlistPageCount', name: 'Playlist browser page count' },
+			{ variableId: 'playlistPageLabel', name: 'Playlist browser page, as 1/4' },
 		]
+		for (let slot = 1; slot <= this.config.playlistSlots; slot++) {
+			variables.push({ variableId: `playlistSlot${slot}Name`, name: `Playlist browser slot ${slot} name` })
+		}
 
 		this.setVariableDefinitions(variables)
 	}
@@ -336,6 +527,10 @@ class SpotifyInstance extends InstanceBase<DeviceConfig> implements SpotifyInsta
 					if (this.canPollOrPost()) {
 						try {
 							await this.doPollPlaybackState()
+
+							if (this.pollCount++ % DEVICE_POLL_EVERY === 0) await this.doPollDevices()
+
+							if (Date.now() - this.lastPlaylistRefresh > PLAYLIST_REFRESH_MS) await this.refreshPlaylists()
 						} catch (e: any) {
 							this.log('debug', `Poll failed: ${e.toString()}`)
 						}
@@ -439,7 +634,7 @@ class SpotifyInstance extends InstanceBase<DeviceConfig> implements SpotifyInsta
 			variableUpdates['isPlaying'] = !!newState?.isPlaying
 			variableUpdates['isPlayingIcon'] = newState?.isPlaying ? '\u23F5' : '\u23F9'
 
-			invalidatedFeedbacks.push(FeedbackId.IsPlaying)
+			invalidatedFeedbacks.push(FeedbackId.IsPlaying, FeedbackId.PlayingOnAnotherDevice)
 		}
 		if (forceUpdate || oldState?.isShuffle !== newState?.isShuffle) {
 			invalidatedFeedbacks.push(FeedbackId.IsShuffle)
@@ -450,7 +645,7 @@ class SpotifyInstance extends InstanceBase<DeviceConfig> implements SpotifyInsta
 			variableUpdates['repeat'] = newState?.repeatState ?? 'off'
 		}
 		if (forceUpdate || oldState?.currentContext !== newState?.currentContext) {
-			this.checkFeedbacks('current-context')
+			this.checkFeedbacks(FeedbackId.CurrentContext, FeedbackId.PlaylistIsPlaying, FeedbackId.PlaylistSlotIsPlaying)
 			variableUpdates['currentContext'] = newState?.currentContext ?? ''
 		}
 
@@ -507,7 +702,7 @@ class SpotifyInstance extends InstanceBase<DeviceConfig> implements SpotifyInsta
 			variableUpdates['deviceName'] = newState?.deviceInfo?.name ?? '-'
 		}
 		if (forceUpdate || oldState?.deviceInfo?.id !== newState?.deviceInfo?.id) {
-			invalidatedFeedbacks.push(FeedbackId.ActiveDevice)
+			invalidatedFeedbacks.push(FeedbackId.ActiveDevice, FeedbackId.PlayingOnAnotherDevice)
 			variableUpdates['deviceId'] = newState?.deviceInfo?.id ?? '-'
 		}
 
